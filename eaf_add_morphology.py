@@ -16,12 +16,13 @@ class EafProcessor:
     rxDir = re.compile('[/\\\\][^/\\\\]+$')
     rxSpeakerCode = re.compile('^\\[[^\\[\\]]+\\]$')
 
-    def __init__(self, tiers,
+    def __init__(self, tiers, lang='',
                  wordType='words', lemmaType='lemma',
-                 grammType='gramm', partsType='parts',
-                 glossType='parts'):
+                 grammType='gramm', partsType='morph',
+                 glossType='gloss'):
         self.eafTree = None
         self.jsonDoc = None
+        self.lang = lang
         self.wordType = wordType
         self.lemmaType = lemmaType
         self.grammType = grammType
@@ -33,6 +34,21 @@ class EafProcessor:
             tiers += '$'
         self.rxTiers = re.compile(tiers)    # regex for names or types of tiers to be analyzed
         self.lastID = 0
+        self.settings = self.load_settings()
+
+    def load_settings(self):
+        """
+        Load tsakorpus settings from a JSON file (needed for ordering
+        grammatical tags correctly).
+        """
+        fnameIn = 'conf/corpus.json'
+        if not os.path.exists(fnameIn):
+            print('conf/corpus.json not found; grammatical tags ordeing can be chaotic.')
+            return {}
+        settings = {}
+        with open(fnameIn, 'r', encoding='utf-8') as fIn:
+            settings = json.load(fIn)
+        return settings
 
     def get_tlis(self, srcTree):
         """
@@ -59,7 +75,9 @@ class EafProcessor:
             return
         with open(fnameEafOut, 'w', encoding='utf-8', newline='\n') as fOut:
             fOut.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-            fOut.write(str(etree.tostring(self.eafTree, pretty_print=True, encoding='unicode')))
+            text = str(etree.tostring(self.eafTree, pretty_print=True, encoding='unicode'))
+            text = text.replace('</TIER><TIER', '</TIER>\n\t<TIER')
+            fOut.write(text)
 
     def clean_segments(self, segments):
         """
@@ -112,28 +130,110 @@ class EafProcessor:
         self.clean_segments(analyzedSegments)
         return analyzedSegments
 
-    def process_segment(self, aID, words, wordTier):
+    def create_dependent_annotation(self, curID, parentID, prevID, text):
+        """
+        Create an XML element representing one annotation in analysis tiers.
+        """
+        if prevID == '':
+            annoTxt = '<ANNOTATION>\n\t\t\t<REF_ANNOTATION ANNOTATION_ID="' + curID \
+                      + '" ANNOTATION_REF="' + parentID + '">\n'
+        else:
+            annoTxt = '<ANNOTATION>\n\t\t\t<REF_ANNOTATION ANNOTATION_ID="' + curID \
+                      + '" ANNOTATION_REF="' + parentID + '" PREVIOUS_ANNOTATION="' + prevID + '">\n'
+        annoTxt += '\t\t\t\t<ANNOTATION_VALUE>' + html.escape(text) \
+                   + '</ANNOTATION_VALUE>\n\t\t\t</REF_ANNOTATION>\n\t\t</ANNOTATION>'
+        return etree.XML(annoTxt)
+
+    def group_ana(self, word):
+        """
+        Group word's analyses by lemma and return them
+        in a dictionary.
+        """
+        anaByLemma = {}
+        if 'ana' not in word:
+            return anaByLemma
+        for ana in word['ana']:
+            if type(ana['lex']) == list:
+                lex = '/'.join(ana['lex'])
+            else:
+                lex = ana['lex']
+            if lex not in anaByLemma:
+                anaByLemma[lex] = [ana]
+            else:
+                anaByLemma[lex].append(ana)
+        return anaByLemma
+
+    def parse_ana(self, ana):
+        """
+        Retrieve grammatical tags and glosses from a JSON analysis.
+        """
+        def key_comp(p):
+            if ('lang_props' not in self.settings
+                    or self.lang not in self.settings['lang_props']
+                    or 'gr_fields_order' not in self.settings['lang_props'][self.lang]):
+                return -1
+            if p[0] not in self.settings['lang_props'][self.lang]['gr_fields_order']:
+                if p[0].lower() == 'pos':
+                    return -2
+                return len(self.settings['lang_props'][self.lang]['gr_fields_order'])
+            return self.settings['lang_props'][self.lang]['gr_fields_order'].index(p[0])
+
+        gramm = ''
+        parts = ana['parts']
+        gloss = ana['gloss']
+        grValues = []
+        for field in sorted(ana):
+            if not field.startswith('gr.'):
+                continue
+            value = ana[field]
+            if type(value) == list:
+                value = ', '.join(value)
+            grValues.append((field[3:], value))
+        for fv in sorted(grValues, key=key_comp):
+            if len(gramm) > 0:
+                gramm += ', '
+            gramm += fv[1]
+        return gramm, parts, gloss
+
+    def process_segment(self, segID, words, wordTier, lemmaTier, grammTier, partsTier, glossTier):
         """
         Add analyses for one segment.
         """
-        prevID = ''
+        prevWordID = ''
         for word in words:
-            curID = 'a' + str(self.lastID)
+            curWordID = 'a' + str(self.lastID)
             self.lastID += 1
-            if prevID == '':
-                wordTxt = '<ANNOTATION>\n\t\t\t<REF_ANNOTATION ANNOTATION_ID="' + curID \
-                          + '" ANNOTATION_REF="' + aID + '">\n'
-            else:
-                wordTxt = '<ANNOTATION>\n\t\t\t<REF_ANNOTATION ANNOTATION_ID="' + curID \
-                          + '" ANNOTATION_REF="' + aID + '" PREVIOUS_ANNOTATION="' + prevID + '">\n'
-            wordTxt += '\t\t\t\t<ANNOTATION_VALUE>' + html.escape(word['wf']) \
-                       + '</ANNOTATION_VALUE>\n\t\t\t</REF_ANNOTATION>\n\t\t</ANNOTATION>'
-            prevID = curID
-            wordTier.insert(-1, etree.XML(wordTxt))
+            wordEl = self.create_dependent_annotation(curWordID, segID, prevWordID, word['wf'])
+            prevWordID = curWordID
+            wordTier.insert(-1, wordEl)
             if word['wtype'] != 'word':
                 continue
+            anaByLemma = self.group_ana(word)
+            prevLemmaID = ''
+            for lemma in sorted(anaByLemma):
+                curLemmaID = 'a' + str(self.lastID)
+                self.lastID += 1
+                lemmaEl = self.create_dependent_annotation(curLemmaID, curWordID, prevLemmaID, lemma)
+                prevLemmaID = curLemmaID
+                lemmaTier.insert(-1, lemmaEl)
+                prevGrammID = ''
+                for ana in anaByLemma[lemma]:
+                    curGrammID = 'a' + str(self.lastID)
+                    self.lastID += 1
+                    curPartsID = 'a' + str(self.lastID)
+                    self.lastID += 1
+                    curGlossID = 'a' + str(self.lastID)
+                    self.lastID += 1
+                    gramm, parts, gloss = self.parse_ana(ana)
+                    grammEl = self.create_dependent_annotation(curGrammID, curLemmaID, prevGrammID, gramm)
+                    partsEl = self.create_dependent_annotation(curPartsID, curGrammID, '', parts)
+                    glossEl = self.create_dependent_annotation(curGlossID, curPartsID, '', gloss)
+                    prevGrammID = curGrammID
+                    grammTier.insert(-1, grammEl)
+                    partsTier.insert(-1, partsEl)
+                    glossTier.insert(-1, glossEl)
 
-    def process_tier(self, tierNode, analyzedSegments):
+    def process_tier(self, tierNode, participant, analyzedSegments):
         """
         Add tokenization and analyses to one transcription tier.
         """
@@ -142,8 +242,8 @@ class EafProcessor:
         nAnalyzed = 0
         iCurAnaSegment = 0
         tierID = tierNode.attrib['TIER_ID']
-        wordTier = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER[@LINGUISTIC_TYPE_REF=\'' + self.wordType + '\''
-                                      ' and @PARENT_REF=\'' + tierID + '\']')[0]
+        wordTier, lemmaTier, grammTier, partsTier, glossTier = self.get_analysis_tiers(tierNode, participant)
+
         for segNode in tierNode.xpath('ANNOTATION/ALIGNABLE_ANNOTATION'):
             if iCurAnaSegment >= len(analyzedSegments):
                 continue
@@ -158,45 +258,102 @@ class EafProcessor:
             startTime = self.tlis[tli1]['time']
             while not (analyzedSegments[iCurAnaSegment]['text'].strip().lower() == segText
                        and startTime - 0.1 <= analyzedSegments[iCurAnaSegment]['start_time'] <= startTime + 0.1):
-                # print(analyzedSegments[iCurAnaSegment]['start_time'], '!=', startTime)
-                # print(analyzedSegments[iCurAnaSegment]['text'].strip().lower(), '!=', segText)
                 iCurAnaSegment += 1
                 if iCurAnaSegment >= len(analyzedSegments):
                     break
             if iCurAnaSegment >= len(analyzedSegments):
                 continue
-            self.process_segment(aID, analyzedSegments[iCurAnaSegment]['words'], wordTier)
+            self.process_segment(aID, analyzedSegments[iCurAnaSegment]['words'],
+                                 wordTier, lemmaTier, grammTier, partsTier, glossTier)
 
         return nTokens, nWords, nAnalyzed
 
-    def check_analysis_tiers(self, tierNode, participant):
+    def get_analysis_tiers(self, tierNode, participant):
         """
         Check if empty analysis tiers are already present for
         the given participant. If not, add them.
+        Return tier nodes for all analysis tiers.
         """
         tierID = tierNode.attrib['TIER_ID']
+        tierParent = tierNode.getparent()
+
         wordTiers = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER[@LINGUISTIC_TYPE_REF=\'' + self.wordType + '\''
                                        ' and @PARENT_REF=\'' + tierID + '\']')
         if len(wordTiers) <= 0:
             wordTierTxt = '<TIER LINGUISTIC_TYPE_REF="' + self.wordType +\
                           '" PARENT_REF="' + tierID + '" PARTICIPANT="' + participant +\
                           '" TIER_ID="Words@' + participant + '"/>\n'
-            tierParent = tierNode.getparent()
             tierParent.insert(tierParent.index(tierNode) + 1, etree.XML(wordTierTxt))
+        wordTier = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER[@LINGUISTIC_TYPE_REF=\'' + self.wordType + '\''
+                                      ' and @PARENT_REF=\'' + tierID + '\']')[0]
+        wordTierID = wordTier.attrib['TIER_ID']
+
+        lemmaTiers = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER[@LINGUISTIC_TYPE_REF=\'' + self.lemmaType + '\''
+                                        ' and @PARENT_REF=\'' + wordTierID + '\']')
+        if len(lemmaTiers) <= 0:
+            lemmaTierTxt = '<TIER LINGUISTIC_TYPE_REF="' + self.lemmaType + \
+                           '" PARENT_REF="' + wordTierID + '" PARTICIPANT="' + participant + \
+                           '" TIER_ID="Lemma@' + participant + '"/>\n'
+            tierParent.insert(tierParent.index(wordTier) + 1, etree.XML(lemmaTierTxt))
+        lemmaTier = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER[@LINGUISTIC_TYPE_REF=\'' + self.lemmaType + '\''
+                                       ' and @PARENT_REF=\'' + wordTierID + '\']')[0]
+        lemmaTierID = lemmaTier.attrib['TIER_ID']
+
+        grammTiers = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER[@LINGUISTIC_TYPE_REF=\'' + self.grammType + '\''
+                                        ' and @PARENT_REF=\'' + lemmaTierID + '\']')
+        if len(grammTiers) <= 0:
+            grammTierTxt = '<TIER LINGUISTIC_TYPE_REF="' + self.grammType + \
+                           '" PARENT_REF="' + lemmaTierID + '" PARTICIPANT="' + participant + \
+                           '" TIER_ID="Gramm@' + participant + '"/>\n'
+            tierParent.insert(tierParent.index(lemmaTier) + 1, etree.XML(grammTierTxt))
+        grammTier = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER[@LINGUISTIC_TYPE_REF=\'' + self.grammType + '\''
+                                       ' and @PARENT_REF=\'' + lemmaTierID + '\']')[0]
+        grammTierID = grammTier.attrib['TIER_ID']
+
+        partsTiers = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER[@LINGUISTIC_TYPE_REF=\'' + self.partsType + '\''
+                                        ' and @PARENT_REF=\'' + grammTierID + '\']')
+        if len(partsTiers) <= 0:
+            partsTierTxt = '<TIER LINGUISTIC_TYPE_REF="' + self.partsType + \
+                           '" PARENT_REF="' + grammTierID + '" PARTICIPANT="' + participant + \
+                           '" TIER_ID="Morph@' + participant + '"/>\n'
+            tierParent.insert(tierParent.index(grammTier) + 1, etree.XML(partsTierTxt))
+        partsTier = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER[@LINGUISTIC_TYPE_REF=\'' + self.partsType + '\''
+                                       ' and @PARENT_REF=\'' + grammTierID + '\']')[0]
+        partsTierID = partsTier.attrib['TIER_ID']
+
+        glossTiers = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER[@LINGUISTIC_TYPE_REF=\'' + self.glossType + '\''
+                                        ' and @PARENT_REF=\'' + partsTierID + '\']')
+        if len(glossTiers) <= 0:
+            glossTierTxt = '<TIER LINGUISTIC_TYPE_REF="' + self.glossType + \
+                           '" PARENT_REF="' + partsTierID + '" PARTICIPANT="' + participant + \
+                           '" TIER_ID="Gloss@' + participant + '"/>\n'
+            tierParent.insert(tierParent.index(partsTier) + 1, etree.XML(glossTierTxt))
+        glossTier = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER[@LINGUISTIC_TYPE_REF=\'' + self.glossType + '\''
+                                       ' and @PARENT_REF=\'' + partsTierID + '\']')[0]
+
+        return wordTier, lemmaTier, grammTier, partsTier, glossTier
 
     def check_tier_types(self):
         """
         Check if ELAN tier types needed for the morphological annotation
         already exist in the ELAN file. If not, add them.
         """
-        wordTypeTxt = '<LINGUISTIC_TYPE CONSTRAINTS="Symbolic_Subdivision"' \
-                      ' GRAPHIC_REFERENCES="false" LINGUISTIC_TYPE_ID="' + self.wordType + '"' \
-                      ' TIME_ALIGNABLE="false"/>\n'
-        wordConstr = self.eafTree.xpath('/ANNOTATION_DOCUMENT/LINGUISTIC_TYPE[@LINGUISTIC_TYPE_ID=\'' + self.wordType + '\']')
-        lastTier = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER')[-1]
-        tierParent = lastTier.getparent()
-        if len(wordConstr) <= 0:
-            tierParent.insert(tierParent.index(lastTier) + 1, etree.XML(wordTypeTxt))
+        tierAttrs = [
+            ('Symbolic_Subdivision', self.wordType),
+            ('Symbolic_Subdivision', self.lemmaType),
+            ('Symbolic_Subdivision', self.grammType),
+            ('Symbolic_Association', self.partsType),
+            ('Symbolic_Association', self.glossType)
+        ]
+        for constraint, tierType in tierAttrs:
+            tierTypeTxt = '<LINGUISTIC_TYPE CONSTRAINTS="' + constraint + '"' \
+                          ' GRAPHIC_REFERENCES="false" LINGUISTIC_TYPE_ID="' + tierType + '"' \
+                          ' TIME_ALIGNABLE="false"/>\n'
+            tierEl = self.eafTree.xpath('/ANNOTATION_DOCUMENT/LINGUISTIC_TYPE[@LINGUISTIC_TYPE_ID=\'' + tierType + '\']')
+            lastTier = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER')[-1]
+            tierParent = lastTier.getparent()
+            if len(tierEl) <= 0:
+                tierParent.insert(tierParent.index(lastTier) + 1, etree.XML(tierTypeTxt))
 
     def add_analyses(self):
         """
@@ -219,8 +376,7 @@ class EafProcessor:
                 if len(participant) <= 0:
                     participant = 'SP' + str(participantID)
                     participantID += 1
-                self.check_analysis_tiers(tierNode, participant)
-                curTokens, curWords, curAnalyzed = self.process_tier(tierNode, analyzedSegments)
+                curTokens, curWords, curAnalyzed = self.process_tier(tierNode, participant, analyzedSegments)
                 nTokens += curTokens
                 nWords += curWords
                 nAnalyzed += curAnalyzed
@@ -281,5 +437,5 @@ class EafProcessor:
 
 
 if __name__ == '__main__':
-    ep = EafProcessor('.*_Transcription-txt-.*')
+    ep = EafProcessor('.*_Transcription-txt-.*', lang='meadow_mari')
     ep.process_corpus()
