@@ -1,0 +1,7 @@
+**.pyc
+**.idea/**
+*.eaf
+*.pfsx
+eaf/**
+eaf_analyzed/**
+json/**
