@@ -19,7 +19,9 @@ class EafProcessor:
     def __init__(self, tiers, lang='',
                  wordType='words', lemmaType='lemma',
                  grammType='gramm', partsType='morph',
-                 glossType='gloss'):
+                 glossType='gloss',
+                 lexTiers=None,
+                 grammTiers=None):
         self.eafTree = None
         self.jsonDoc = None
         self.lang = lang
@@ -28,6 +30,12 @@ class EafProcessor:
         self.grammType = grammType
         self.partsType = partsType
         self.glossType = glossType
+        self.addLexTiers = []      # Additional tiers, children of lemma tier
+        if lexTiers is not None:
+            self.addLexTiers = lexTiers
+        self.addGrammTiers = []    # Additional tiers, children of gramm tier
+        if grammTiers is not None:
+            self.addGrammTiers = grammTiers
         if not tiers.startswith('^'):
             tiers = '^' + tiers
         if not tiers.endswith('$'):
@@ -195,7 +203,8 @@ class EafProcessor:
             gramm += fv[1]
         return gramm, parts, gloss
 
-    def process_segment(self, segID, words, wordTier, lemmaTier, grammTier, partsTier, glossTier):
+    def process_segment(self, segID, words, wordTier, lemmaTier, grammTier,
+                        partsTier, glossTier, addLexTiers, addGrammTiers):
         """
         Add analyses for one segment.
         """
@@ -217,6 +226,17 @@ class EafProcessor:
                 prevLemmaID = curLemmaID
                 lemmaTier.insert(-1, lemmaEl)
                 prevGrammID = ''
+                for addLexTier in addLexTiers:
+                    # It is assumed that the value of addLexTier is the same
+                    # for all analyses with the given lemma
+                    if addLexTier in anaByLemma[lemma][0]:
+                        curAddID = 'a' + str(self.lastID)
+                        self.lastID += 1
+                        value = anaByLemma[lemma][0][addLexTier]
+                        if type(value) == list:
+                            value = '/'.join(value)
+                        addEl = self.create_dependent_annotation(curAddID, curLemmaID, '', value)
+                        addLexTiers[addLexTier].insert(-1, addEl)
                 for ana in anaByLemma[lemma]:
                     curGrammID = 'a' + str(self.lastID)
                     self.lastID += 1
@@ -232,6 +252,15 @@ class EafProcessor:
                     grammTier.insert(-1, grammEl)
                     partsTier.insert(-1, partsEl)
                     glossTier.insert(-1, glossEl)
+                    for addGrammTier in addGrammTiers:
+                        if addGrammTier in ana:
+                            curAddID = 'a' + str(self.lastID)
+                            self.lastID += 1
+                            value = ana[addGrammTier]
+                            if type(value) == list:
+                                value = '/'.join(value)
+                            addEl = self.create_dependent_annotation(curAddID, curGrammID, '', value)
+                            addGrammTiers[addGrammTier].insert(-1, addEl)
 
     def process_tier(self, tierNode, participant, analyzedSegments):
         """
@@ -242,7 +271,7 @@ class EafProcessor:
         nAnalyzed = 0
         iCurAnaSegment = 0
         tierID = tierNode.attrib['TIER_ID']
-        wordTier, lemmaTier, grammTier, partsTier, glossTier = self.get_analysis_tiers(tierNode, participant)
+        wordTier, lemmaTier, grammTier, partsTier, glossTier, addLexTiers, addGrammTiers = self.get_analysis_tiers(tierNode, participant)
 
         for segNode in tierNode.xpath('ANNOTATION/ALIGNABLE_ANNOTATION'):
             if iCurAnaSegment >= len(analyzedSegments):
@@ -263,8 +292,17 @@ class EafProcessor:
                     break
             if iCurAnaSegment >= len(analyzedSegments):
                 continue
-            self.process_segment(aID, analyzedSegments[iCurAnaSegment]['words'],
-                                 wordTier, lemmaTier, grammTier, partsTier, glossTier)
+            words = analyzedSegments[iCurAnaSegment]['words']
+            nTokens += len(words)
+            nWords += sum(1 for word in words if word['wtype'] == 'word')
+            nAnalyzed += sum(1 for word in words
+                             if word['wtype'] == 'word'
+                             and 'ana' in word
+                             and len(word['ana']) > 0
+                             and any(len(ana) > 0 for ana in word['ana']))
+            self.process_segment(aID, words,
+                                 wordTier, lemmaTier, grammTier, partsTier, glossTier,
+                                 addLexTiers, addGrammTiers)
 
         return nTokens, nWords, nAnalyzed
 
@@ -299,6 +337,16 @@ class EafProcessor:
                                        ' and @PARENT_REF=\'' + wordTierID + '\']')[0]
         lemmaTierID = lemmaTier.attrib['TIER_ID']
 
+        addLexTiers = {}    # tier type -> tier node
+        for addLexTierName in sorted(self.addLexTiers, reverse=True):
+            addTierTxt = '<TIER LINGUISTIC_TYPE_REF="' + addLexTierName + \
+                         '" PARENT_REF="' + lemmaTierID + '" PARTICIPANT="' + participant + \
+                         '" TIER_ID="' + addLexTierName + '@' + participant + '"/>\n'
+            tierParent.insert(tierParent.index(lemmaTier) + 1, etree.XML(addTierTxt))
+            addLexTier = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER[@LINGUISTIC_TYPE_REF=\'' + addLexTierName + '\''
+                                            ' and @PARENT_REF=\'' + lemmaTierID + '\']')[0]
+            addLexTiers[addLexTierName] = addLexTier
+
         grammTiers = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER[@LINGUISTIC_TYPE_REF=\'' + self.grammType + '\''
                                         ' and @PARENT_REF=\'' + lemmaTierID + '\']')
         if len(grammTiers) <= 0:
@@ -331,7 +379,17 @@ class EafProcessor:
         glossTier = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER[@LINGUISTIC_TYPE_REF=\'' + self.glossType + '\''
                                        ' and @PARENT_REF=\'' + partsTierID + '\']')[0]
 
-        return wordTier, lemmaTier, grammTier, partsTier, glossTier
+        addGrammTiers = {}  # tier type -> tier node
+        for addGrammTierName in sorted(self.addGrammTiers, reverse=True):
+            addTierTxt = '<TIER LINGUISTIC_TYPE_REF="' + addGrammTierName + \
+                         '" PARENT_REF="' + grammTierID + '" PARTICIPANT="' + participant + \
+                         '" TIER_ID="' + addGrammTierName + '@' + participant + '"/>\n'
+            tierParent.insert(tierParent.index(grammTier) + 1, etree.XML(addTierTxt))
+            addGrammTier = self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER[@LINGUISTIC_TYPE_REF=\'' + addGrammTierName + '\''
+                                              ' and @PARENT_REF=\'' + grammTierID + '\']')[0]
+            addGrammTiers[addGrammTierName] = addGrammTier
+
+        return wordTier, lemmaTier, grammTier, partsTier, glossTier, addLexTiers, addGrammTiers
 
     def check_tier_types(self):
         """
@@ -345,6 +403,10 @@ class EafProcessor:
             ('Symbolic_Association', self.partsType),
             ('Symbolic_Association', self.glossType)
         ]
+        for addLexTier in self.addLexTiers:
+            tierAttrs.append(('Symbolic_Association', addLexTier))
+        for addGrammTier in self.addGrammTiers:
+            tierAttrs.append(('Symbolic_Association', addGrammTier))
         for constraint, tierType in tierAttrs:
             tierTypeTxt = '<LINGUISTIC_TYPE CONSTRAINTS="' + constraint + '"' \
                           ' GRAPHIC_REFERENCES="false" LINGUISTIC_TYPE_ID="' + tierType + '"' \
@@ -372,7 +434,10 @@ class EafProcessor:
             tierID = tierNode.attrib['TIER_ID']
             if (self.rxTiers.search(tierID) is not None
                     or self.rxTiers.search(tierNode.attrib['LINGUISTIC_TYPE_REF']) is not None):
-                participant = tierNode.attrib['PARTICIPANT']
+                if 'PARTICIPANT' not in tierNode.attrib:
+                    participant = ''
+                else:
+                    participant = tierNode.attrib['PARTICIPANT']
                 if len(participant) <= 0:
                     participant = 'SP' + str(participantID)
                     participantID += 1
@@ -437,5 +502,7 @@ class EafProcessor:
 
 
 if __name__ == '__main__':
-    ep = EafProcessor('.*_Transcription-txt-.*', lang='meadow_mari')
+    # ep = EafProcessor('.*_Transcription-txt-.*', lang='meadow_mari')
+    ep = EafProcessor('tx@.*', lang='adyghe',
+                      grammTiers=['trans_ru', 'lex2', 'trans_ru2'])
     ep.process_corpus()
