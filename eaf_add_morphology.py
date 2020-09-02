@@ -187,8 +187,12 @@ class EafProcessor:
             return self.settings['lang_props'][self.lang]['gr_fields_order'].index(p[0])
 
         gramm = ''
-        parts = ana['parts']
-        gloss = ana['gloss']
+        parts = ''
+        if 'parts' in ana:
+            parts = ana['parts']
+        gloss = ''
+        if 'gloss' in ana:
+            gloss = ana['gloss']
         grValues = []
         for field in sorted(ana):
             if not field.startswith('gr.'):
