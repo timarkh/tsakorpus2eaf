@@ -21,7 +21,9 @@ class EafProcessor:
                  grammType='gramm', partsType='morph',
                  glossType='gloss',
                  lexTiers=None,
-                 grammTiers=None):
+                 grammTiers=None,
+                 csTier=None,
+                 csTurnOffRegex=''):
         self.eafTree = None
         self.jsonDoc = None
         self.lang = lang
@@ -36,6 +38,20 @@ class EafProcessor:
         self.addGrammTiers = []    # Additional tiers, children of gramm tier
         if grammTiers is not None:
             self.addGrammTiers = grammTiers
+        self.csTier = ''            # Tier where code switching is annotated
+                                    # (must be associated with the transcription)
+        self.rxCSTier = ''
+        if csTier is not None:
+            self.csTier = csTier
+            self.csTurnOffRegex = re.compile(csTurnOffRegex)
+            # Do not annotate transcription segments
+            # if the associated CS segment matches this regex
+            if not self.csTier.startswith('^'):
+                self.csTier = '^' + self.csTier
+            if not self.csTier.endswith('$'):
+                self.csTier += '$'
+            self.rxCSTier = re.compile(self.csTier)
+        self.csTranscriptionSegments = []
         if not tiers.startswith('^'):
             tiers = '^' + tiers
         if not tiers.endswith('$'):
@@ -212,6 +228,9 @@ class EafProcessor:
         """
         Add analyses for one segment.
         """
+        nTokens = 0
+        nWords = 0
+        nAnalyzed = 0
         prevWordID = ''
         for word in words:
             curWordID = 'a' + str(self.lastID)
@@ -219,9 +238,16 @@ class EafProcessor:
             wordEl = self.create_dependent_annotation(curWordID, segID, prevWordID, word['wf'])
             prevWordID = curWordID
             wordTier.insert(-1, wordEl)
+            if segID in self.csTranscriptionSegments:
+                # Do not annotate code switches
+                continue
+            nTokens += 1
             if word['wtype'] != 'word':
                 continue
+            nWords += 1
             anaByLemma = self.group_ana(word)
+            if len(anaByLemma) > 0:
+                nAnalyzed += 1
             prevLemmaID = ''
             for lemma in sorted(anaByLemma):
                 curLemmaID = 'a' + str(self.lastID)
@@ -265,6 +291,7 @@ class EafProcessor:
                                 value = '/'.join(value)
                             addEl = self.create_dependent_annotation(curAddID, curGrammID, '', value)
                             addGrammTiers[addGrammTier].insert(-1, addEl)
+        return nTokens, nWords, nAnalyzed
 
     def process_tier(self, tierNode, participant, analyzedSegments):
         """
@@ -297,16 +324,13 @@ class EafProcessor:
             if iCurAnaSegment >= len(analyzedSegments):
                 continue
             words = analyzedSegments[iCurAnaSegment]['words']
-            nTokens += len(words)
-            nWords += sum(1 for word in words if word['wtype'] == 'word')
-            nAnalyzed += sum(1 for word in words
-                             if word['wtype'] == 'word'
-                             and 'ana' in word
-                             and len(word['ana']) > 0
-                             and any(len(ana) > 0 for ana in word['ana']))
-            self.process_segment(aID, words,
-                                 wordTier, lemmaTier, grammTier, partsTier, glossTier,
-                                 addLexTiers, addGrammTiers)
+            curNTokens, curNWords, curNAnalyzed =\
+                self.process_segment(aID, words,
+                                     wordTier, lemmaTier, grammTier, partsTier, glossTier,
+                                     addLexTiers, addGrammTiers)
+            nTokens += curNTokens
+            nWords += curNWords
+            nAnalyzed += curNAnalyzed
 
         return nTokens, nWords, nAnalyzed
 
@@ -421,6 +445,30 @@ class EafProcessor:
             if len(tierEl) <= 0:
                 tierParent.insert(tierParent.index(lastTier) + 1, etree.XML(tierTypeTxt))
 
+    def collectCSData(self):
+        """
+        If there are code switching tiers, collect IDs of
+        transcription segments corresponding to the code
+        switching instances.
+        """
+        if self.csTier is None or len(self.csTier) <= 0:
+            return
+        for tierNode in self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER'):
+            if 'TIER_ID' not in tierNode.attrib:
+                continue
+            tierID = tierNode.attrib['TIER_ID']
+            if (self.rxCSTier.search(tierID) is not None
+                    or self.rxCSTier.search(tierNode.attrib['LINGUISTIC_TYPE_REF']) is not None):
+                for segNode in tierNode.xpath('ANNOTATION/REF_ANNOTATION'):
+                    if 'ANNOTATION_REF' not in segNode.attrib:
+                        continue
+                    try:
+                        segText = segNode.xpath('ANNOTATION_VALUE')[0].text.strip().lower()
+                    except AttributeError:
+                        continue
+                    if self.csTurnOffRegex.search(segText) is not None:
+                        self.csTranscriptionSegments.append(segNode.attrib['ANNOTATION_REF'])
+
     def add_analyses(self):
         """
         Add analyses from self.jsonDoc to self.eafTree.
@@ -432,6 +480,7 @@ class EafProcessor:
         self.tlis = self.get_tlis(self.eafTree)
         self.check_tier_types()
         participantID = 1
+        self.collectCSData()
         for tierNode in self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER'):
             if 'TIER_ID' not in tierNode.attrib:
                 continue
@@ -506,7 +555,9 @@ class EafProcessor:
 
 
 if __name__ == '__main__':
-    # ep = EafProcessor('.*_Transcription-txt-.*', lang='meadow_mari')
-    ep = EafProcessor('tx@.*', lang='adyghe',
-                      grammTiers=['trans_ru', 'lex2', 'trans_ru2'])
+    ep = EafProcessor('.*_Transcription-txt-.*', lang='meadow_mari',
+                      grammTiers=['trans_ru', 'lex2', 'trans_ru2'],
+                      csTier='.*_cs-txt-mhr', csTurnOffRegex='^ *ru *$')
+    # ep = EafProcessor('tx@.*', lang='adyghe',
+    #                   grammTiers=['trans_ru', 'lex2', 'trans_ru2'])
     ep.process_corpus()
