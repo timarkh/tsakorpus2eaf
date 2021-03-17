@@ -453,6 +453,7 @@ class EafProcessor:
         """
         if self.csTier is None or len(self.csTier) <= 0:
             return
+        self.csTranscriptionSegments = []
         for tierNode in self.eafTree.xpath('/ANNOTATION_DOCUMENT/TIER'):
             if 'TIER_ID' not in tierNode.attrib:
                 continue
