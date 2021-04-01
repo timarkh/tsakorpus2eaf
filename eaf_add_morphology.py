@@ -174,17 +174,20 @@ class EafProcessor:
         in a dictionary.
         """
         anaByLemma = {}
+        usedAna = set()
         if 'ana' not in word:
             return anaByLemma
         for ana in word['ana']:
+            anaStr = json.dumps(ana, ensure_ascii=False, indent=-1, sort_keys=True)
             if type(ana['lex']) == list:
                 lex = '/'.join(ana['lex'])
             else:
                 lex = ana['lex']
             if lex not in anaByLemma:
                 anaByLemma[lex] = [ana]
-            else:
+            elif anaStr not in usedAna:
                 anaByLemma[lex].append(ana)
+                usedAna.add(anaStr)
         return anaByLemma
 
     def parse_ana(self, ana):
